@@ -1,0 +1,399 @@
+---
+title: "Trabajo Camacol"
+author: "Kevin Ramirez"
+date: "1/4/2022"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+#devtools::install_github("ropensci/geonames") #Instalacion de geonames
+
+
+options(scipen = 999)
+options(geonamesUsername="kevin.ramirez") #Usuario de geonames para poder accder a la API
+library(geonames)
+library(dplyr)
+#library(xlsx)
+library(rvest)
+library(tidyr)
+library(leaflet)
+library(ggplot2)
+library(hrbrthemes)
+library(caTools)
+library(randomForest)
+library(ggcorrplot)
+library(e1071)
+
+```
+
+## Transformación de los datos
+
+Cargamos la base a R y observamos como se componen los datos. La base contiene 1120 filas con 13 columnas las cuales son todas de tipo character. Además notamos que *Área* contiene no solo el tamaño del inmueble, también contiene la cantidad de habitaciones, baños y parqueaderos que contiene el inmueble por lo cual debemos transformarla en 4 columnas nuevas.
+
+
+```{r cars, echo=TRUE, message=FALSE, warning=FALSE}
+
+base2 <-  ws_fr_vn_ver2_cs[-1]
+
+summary(base2)
+```
+
+
+### Eliminación de columnas
+
+Eliminamos Zona y Direccion ya que la ubicación del inmueble está controlada por el estrato y la ciudad. De igual manera borramos el resto de las columnas que no brindan información relevante a la predicción del modelo.
+
+```{r pressure,  message=FALSE, warning=FALSE}
+col_para_eliminar <- c("Zona", "Constructora", "Proyecto", "Consulta", "Dirección", "Publicación", "Descipción")
+
+base <- base2[, !(names(base2) %in% col_para_eliminar)]
+```
+
+### Creación de  nuevas columnas
+
+Con la función separate() de dplyr y usando regex separamos las cuatro columnas y eliminamos los caracteres no numéricos para poder convertirlas a tipo numeric.
+
+Las nuevas columnas son *Area_m2*', *Habitaciones*, *Banios*, *Parqueadero* y *Es_destacado* la cual es una variable dummy que especifica si dicho proyecto esta destacado en fincaraiz o no.
+
+
+```{r message=FALSE, warning=FALSE}
+# Convertimos area en 4 columnas diferentes
+
+base$Área <- gsub('Áreas desde ', "", base$Área)
+
+base <- base %>%  separate(col = Área, c('Area_m2', 'Habitaciones', 'Banios', 'Parqueadero'), sep = " • ")
+
+base$Area_m2 <- gsub(',','.', base$Area_m2)
+base$Area_m2 <- as.numeric(gsub('m.*','', base$Area_m2))
+
+
+#convertir a numeric
+convertir_numeric <- c('Habitaciones', 'Banios', 'Parqueadero')
+base[convertir_numeric] <- lapply(base[convertir_numeric], function (x) as.numeric(gsub('\\D+', '', x)))
+
+
+#Eliminamos simbolos innecesarios
+
+eliminar_simbolo <- c('Precio', 'Estrato')
+base[eliminar_simbolo] <- lapply(base[eliminar_simbolo], function (x) gsub('$', '', x, fixed = T))
+base[eliminar_simbolo] <- lapply(base[eliminar_simbolo], function (x) as.numeric(gsub('.', '', x, fixed = T)))
+
+base['Es_destacado'] <- lapply(base['Destacado'], function (x) ifelse(x == 'Proyecto',0,1))
+
+```
+
+### Visualizamos los NAs
+
+Con summary() nos damos una idea de la manera en que están distribuidos los datos. Curiosamente en estrato hay cifras que se encuentran en los millones, probablemente porque el webscrapper tomo el precio del inmueble como el estrato.
+
+Observamos que hay una gran cantidad de NAs en habitaciones, parqueaderos y baños ya que estos datos no se encontraban en las publicaciones.
+
+Adicionalmente, existen publicaciones que contienen un alto número de parqueaderos por inmueble. Investigando unas cuantas publicaciones es evidente que el scrapper tomo los datos de los parqueaderos de todo el conjunto por lo cual el dato es erróneo y debe ser corregido.
+
+
+
+
+
+```{r message=FALSE, warning=FALSE}
+summary(base)
+base %>%
+  gather(key = "key", value = "val") %>% 
+  mutate(is.missing = is.na(val)) %>% 
+  group_by(key, is.missing) %>%
+  summarise(num_missing = n())%>%
+  filter(is.missing == TRUE, num_missing > 1) %>% 
+  select(-is.missing) %>%
+  arrange(desc(num_missing)) %>% 
+  ggplot(aes(x = reorder(key, num_missing), y = num_missing, fill = key)) +
+  geom_col() +
+  coord_flip() +
+  xlab("Variable") +
+  ylab("Datos Faltantes")+
+  theme(legend.position='none') + theme_ipsum()
+
+```
+
+
+### Webscrapping
+
+Para reemplazar los precios que se colaron en la columna de estrato, usamos el paquete rvest para realizar un webscrapping de cada link donde el valor de estrato sea mayor a 6 (La información se encuentra en el 12 <p> tag de la página).
+
+Para evitar que el for loop se detenga cuando no pueda conectarse al link lo metemos dentro de un try statement.
+
+
+
+```{r message=FALSE, warning=FALSE}
+
+
+
+for (i in 1:nrow(base)) {
+
+  if (base[i,'Estrato'] > 6) {
+    
+    try({
+    
+    url <-  base[i, 'Link']
+    pag <-  read_html(url) %>% html_nodes('p') 
+    base[i, 'Estrato'] <-  as.numeric(html_text(pag[12]))
+    
+    }
+    )
+  }
+}
+  
+
+```
+
+Hubo 4 links caídos dado que la publicación ya fue eliminada. Al filtrar la información se observa que esas publicaciones están ubicadas en Girón por lo que reemplazamos ese dato con la moda del estrato en Girón el cual es 3.
+
+```{r message=FALSE, warning=FALSE}
+
+base['Estrato'][base['Estrato']>7] <- 3
+
+```
+
+Usamos la moda para reemplazar los datos faltantes. De igual manera usamos la moda para reemplazar el número de parqueaderos cuya cifra es muy alta. De esta manera ya tenemos lo necesario para poder realizar le análisis exploratorio de los datos.
+
+```{r message=FALSE, warning=FALSE}
+
+mediana_hab <- as.numeric(names(sort(-table(base$Habitaciones)))[1])
+mediana_par <- as.numeric(names(sort(-table(base$Parqueadero)))[1])
+mediana_ba <- as.numeric(names(sort(-table(base$Banios)))[1])
+
+base$Habitaciones  <-replace_na(base$Habitaciones, mediana_hab)
+base$Banios <- replace_na(base$Banios, mediana_ba)
+base$Parqueadero <- replace_na(base$Banios, mediana_par)
+
+base$Parqueadero <- replace(base$Parqueadero, base$Parqueadero >5, mediana_par)
+
+summary(base)
+
+```
+
+## Visualización de los Datos
+
+Usando las APIs de geonames y leaflet podemos generar un mapa que nos muestre la distribución de los datos:
+
+```{r message=FALSE, warning=FALSE}
+
+#Reemplazamos nombres para que coincidan con los resultados de geonames
+
+base[base==' Cali'] <- ' Santiago de Cali'
+base[base==' El Retiro'] <- ' Retiro'
+
+# Lista de las ciudades  
+ciudades <- unlist(list(unique(base$Ciudad)))
+
+# Funcion para generar el query 
+GNsearchAF <- function(city) {  
+  res <- GNsearch(name=city, country="CO")  
+  return(res[1,c("name","adminName1","population","lng","lat")])  
+}
+
+# Aplicamos el resultado de cada query a una nueva df 
+GNresult <- do.call(rbind, lapply(ciudades, GNsearchAF))
+colnames(GNresult) <- c("Ciudad", "Departamento", "Población", "Longitud", "Latitud")
+GNresult[,3:5] <- sapply(GNresult[,3:5], as.numeric)
+
+Colombia <- GNcountryInfo('CO')
+
+Colombia_children <- GNchildren(Colombia$geonameId)
+
+
+conteo <- as.data.frame(table(base$Ciudad)) 
+
+colnames(conteo) <- c('Ciudad', 'Freq')
+
+GNresult <-cbind(GNresult[order(GNresult$Ciudad),], conteo[order(conteo$Ciudad),])
+```
+
+### Generamos el mapa dinamico usando el API de leaflet
+
+El mapa  nos muestra en que parte del territorio colombiano se encuentran las publicaciones, además nos indica la cantidad de publicaciones de acuerdo a la intensidad del color y el tamaño de cada circulo.
+
+```{r message=FALSE, warning=FALSE, results='asis'}
+
+GNresult$label <- with(GNresult, paste(
+   Ciudad, "-,",
+    Departamento, "-",
+  "Cantidad Publicaciones:", Freq
+  ))
+
+leaflet(GNresult) %>% addProviderTiles(providers$CartoDB.Positron) %>%  
+  addCircles(lng = ~Longitud, lat = ~Latitud, weight = 15,
+             radius = ~Freq*20, label = ~label)
+
+
+```
+
+ 
+
+Graficamos la relación entre el precio el área y el estrato. Como es de esperarse, se puede observar un clustering en el precio de los inmuebles de acuerdo con su estrato.
+
+```{r message=FALSE, warning=FALSE}
+
+base$Estrato <- factor(base$Estrato)
+ggplot(base, aes(x=Area_m2, y= Precio, color=Estrato)) + 
+    geom_point(size=1) + theme_ipsum() + scale_y_continuous(limits = c(10000000, 1000000000)) + scale_x_continuous(limits = c(0,200)) 
+
+```
+
+Al graficar las frecuencias de baños y habitaciones notamos que la gran mayoría de publicaciones cuenta con 2 baños y 3 alcobas.
+
+
+```{r message=FALSE, warning=FALSE}
+ggplot(base, aes(x = Habitaciones))+
+      geom_bar(color="black", fill="#116b8c", alpha = 0.7 ) + 
+      theme_ipsum() +
+      ggtitle('Frecuencia Habitaciones')
+
+
+ ggplot(base, aes(x = Banios))+ 
+      geom_bar(color="black", fill="#116b8c", alpha = 0.7 ) + 
+      theme_ipsum() +
+      ggtitle('Frecuencia Baños')
+
+
+```
+
+## Predicción
+
+### Preparacion de los datos
+
+Para estimar un modelo de predicción de precio de acuerdo con los datos que ya tenemos necesitamos representar la importancia de la ciudad donde se encuentra la vivienda, ya que no es lo mismo un apartamento de 80m2 en Bogotá que en Puerto Colombia.
+
+Para lidiar con los datos categóricos se podría aplicar un one hot encoding a *Ciudad* pero terminarios con un modelo con demasiadas dimensiones para una muestra demasiado pequeña. 
+
+En este caso es mejor reemplazar cada ciudad por las veces que aparece en el dataframe de esta manera controlamos por la demanda que existe en cada ciudad ya que esto influye directamente en su precio.
+
+También transformamos la columna de *Precio* para que quede expresada en millones COP.
+
+
+```{r message=FALSE, warning=FALSE}
+prediccion = left_join(base, conteo)
+
+col_elim = c('Ciudad', 'Destacado', 'Link')
+
+prediccion = prediccion[, !(names(prediccion) %in% col_elim)]
+
+prediccion['Precio'] = lapply(prediccion['Precio'], function(x)x= x/1000000)
+
+prediccion$Estrato = as.numeric(prediccion$Estrato)
+prediccion$Area_m2 = as.numeric(prediccion$Area_m2)
+
+glimpse(prediccion)
+
+```
+
+Graficando la matriz de correlación podemos observar que el precio esta as correlacionado con el área, seguido de el estrato y la cantidad de baños.
+
+```{r}
+corr <- cor(prediccion)
+ggcorrplot(corr, hc.order = TRUE, type = "lower",
+     outline.col = "white", lab=T)
+```
+
+
+La gran mayoria de los precios se encuentran por debajo de los 1000 millones COP con promedio de 470 millones y una media de casi 400 millones. Sin embargo, existen outliers entro los 1000 y 4000 millones.
+
+```{r}
+ggplot(prediccion, aes(x = Precio)) + geom_histogram(binwidth=25, fill="#69b3a2", color="#e9ecef", alpha=0.9) + theme_ipsum()
+summary(prediccion$Precio)
+```
+
+Dividimos la base entre entrenamiento y prueba. Dado que vamos a entrenar un Random Forest no es necesario normalizar los datos ya que este modelo no depende de distancia euclidiana.
+
+```{r message=FALSE, warning=FALSE}
+set.seed(1)
+
+muestra <- sample.split(prediccion$Precio, SplitRatio = .8)
+
+entrenamineto <-  subset(prediccion, muestra == T)
+test <- subset(prediccion, muestra == F)
+```
+
+### Random Forest
+
+Entrenamos el modelo y graficamos la importancia de cada variable para el modelo.
+
+
+```{r}
+rf <-  randomForest(Precio ~., data = entrenamineto, ntree = 300)
+
+ImpData <- as.data.frame(importance(rf))
+
+ImpData$Variables <- row.names(ImpData)
+colnames(ImpData) <- c("Mean Decrease Gini", "Variables")
+
+
+ggplot(ImpData, aes(x=Variables, y=`Mean Decrease Gini`)) +
+                geom_segment( aes(x=Variables, xend=Variables, y=0, yend=`Mean Decrease Gini`), color="blue") +
+                geom_point(aes(size = `Mean Decrease Gini`), color="blue", alpha=0.6) +
+                theme_light() +
+                coord_flip() +
+                theme_ipsum() + 
+                ggtitle('Importancia de las Variables')
+```
+Como era de esperarse, el área del inmueble es la variable mas importante para el modelo de acuerdo al mean decrease gini, seguid del estrato y la cantidad de baños como habíamos observado en la matriz de correlación.
+
+Al graficar la evolución del error observamos una gran caída a partir del árbol 25 y se empieza a estabilizar a partir del árbol 200.
+
+
+```{r message=FALSE, warning=FALSE}
+plot(rf, main = "Error Random Forest", col = 'Red')
+```
+
+```{r message=FALSE, warning=FALSE}
+pred <-  predict(rf, newdata = test[-1])
+
+pred_df <-  as.data.frame(pred, col.names ="Pred")
+
+comparacion <- cbind(test[1],pred)
+
+rmse = (sqrt(mean(comparacion$Precio - comparacion$pred)^2))
+
+print(paste('RMSE:', rmse))
+
+```
+
+### SVM
+
+Para entrenar un Support Vector Machine primero debemos estandarizar los datos ya que este modelo si se basa en distancias para generar predicciones:
+
+```{r}
+entrenamiento_est <- as.data.frame(lapply(entrenamineto[-1], function(x) (x-min(x))/(max(x)-min(x))))
+entrenamiento_est <- cbind(entrenamiento_est, entrenamineto[1])
+test_est <-as.data.frame(lapply(test[-1], function(x) (x-min(x))/(max(x)-min(x))))
+test_est <-  cbind(test_est, test[1])
+```
+
+Procedemos a generar el modelo y calculamos su RMSE:
+
+```{r}
+modelosvm <-  svm(Precio~.,entrenamiento_est)
+
+pred_svm <- predict(modelosvm, newdata = test_est[1:7])
+
+pred_2 <-  as.data.frame(pred_svm, col.names ="Pred")
+
+comparacion_svm <- cbind(test[1],pred_2)
+
+rmse_svm = (sqrt(mean(comparacion_svm$Precio - comparacion_svm$pred)^2))
+
+print(paste('RMSE:', rmse_svm))
+```
+Podemos observar una gran diferencia entre el RSME del random forest y del SVM, sin embargo la explicación mas factible es que el RMSE tan pequeño del random forest se debe a overfitting. Mejorar el modelo se puede trabajar mas adelante pero por ahora ese es el modelo que se usara para generar predicciones en el tablero de control. 
+
+```{r eval=FALSE}
+saveRDS(rf, 'rf.rds')
+
+```
+
+[Tablero](https://krrrr.shinyapps.io/tablero/?_ga=2.176201317.1311163216.1649061031-1629539394.1647569523)
+
